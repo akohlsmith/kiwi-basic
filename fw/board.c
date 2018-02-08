@@ -12,8 +12,12 @@
 #include <libopencm3/stm32/adc.h>
 #include <libopencm3/stm32/dma.h>
 #include <libopencm3/stm32/flash.h>
+#include <libopencm3/stm32/spi.h>
+#include <libopencm3/stm32/exti.h>
 
 #include "board.h"
+#include "gpsdo.h"
+#include "uxb_locm3.h"
 
 uint32_t ccr_old = 0;
 
@@ -22,10 +26,61 @@ uint16_t adc_buffer[ADC_BUFFER_SIZE];
 
 uint32_t samples = 0;
 
+Gpsdo gpsdo;
+UxbMasterLocm3 uxb;
+UxbInterface iface1;
+UxbSlot slot1;
+UxbSlot descriptor_slot;
+uint8_t slot1_buffer[1024];
+
+const char *uxb_descriptor[] = {
+	"device=kiwi-basic",
+	"hw-version=1.0.0+20170723",
+	"fw-version=1.0.0",
+	"cspeed=4",
+	"dspeed=4",
+	"slot=1,bootloader,1.0.0",
+	"slot=2,rtc,1.0.0",
+	"slot=3,hrtime,1.0.0",
+	"slot=4,waveform,1.0.0",
+	NULL,
+};
+
+uint8_t descriptor_slot_buffer[64];
+
 static void delay_simple(uint32_t d) {
 	for (uint32_t i = 0; i < d; i++) {
 		__asm__("nop");
 	}
+}
+
+
+static uxb_master_locm3_ret_t uxb_read_descriptor(void *context, uint8_t *buf, size_t len) {
+	uint8_t zero = 0;
+
+	if (len != 1) {
+		return UXB_MASTER_LOCM3_RET_FAILED;
+	}
+	if (buf[0] == 0) {
+		/* Send the 0 back. */
+		uxb_slot_send_data(&descriptor_slot, &zero, 1, true);
+	} else {
+		uint8_t descriptor_index = buf[0] - 1;
+		if (uxb_descriptor[descriptor_index] == NULL) {
+			uxb_slot_send_data(&descriptor_slot, &zero, 1, true);
+		} else {
+			uxb_slot_send_data(&descriptor_slot, uxb_descriptor[descriptor_index], strlen(uxb_descriptor[descriptor_index]) + 1, true);
+		}
+	}
+
+	return UXB_MASTER_LOCM3_RET_OK;
+}
+
+
+static uxb_master_locm3_ret_t uxb_data_received(void *context, uint8_t *buf, size_t len) {
+	// usart_send_blocking(USART1, 'A');
+	uxb_slot_send_data(&slot1, (uint8_t *)adc_buffer, 1024, true);
+	return UXB_MASTER_LOCM3_RET_OK;
 }
 
 
@@ -61,6 +116,7 @@ void gpio_setup(void) {
 	rcc_periph_clock_enable(RCC_DMA1);
 	rcc_periph_clock_enable(RCC_TIM1);
 	rcc_periph_clock_enable(RCC_TIM8);
+	rcc_periph_clock_enable(RCC_DAC1);
 
 	nvic_enable_irq(NVIC_TIM1_CC_IRQ);
 	nvic_enable_irq(NVIC_TIM2_IRQ);
@@ -81,6 +137,76 @@ void gpio_setup(void) {
 
 	/* ADC1, channel 4, no filter, fast channel. */
 	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO3);
+
+	/* VCTCXO steering, DAC output. */
+	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO4);
+
+	/* Initialize the UXB bus. */
+	rcc_periph_clock_enable(RCC_SPI1);
+	rcc_periph_clock_enable(RCC_TIM7);
+
+	/* Setup a timer for precise UXB protocol delays. */
+	timer_reset(TIM7);
+	timer_set_mode(TIM7, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+	timer_continuous_mode(TIM7);
+	timer_direction_up(TIM7);
+	timer_disable_preload(TIM7);
+	timer_enable_update_event(TIM7);
+	timer_set_prescaler(TIM7, (rcc_ahb_frequency / 1000000) - 1);
+	timer_set_period(TIM7, 65535);
+	timer_enable_counter(TIM7);
+
+	uxb_master_locm3_init(&uxb, &(struct uxb_master_locm3_config) {
+		.spi_port = SPI1,
+		.spi_af = GPIO_AF5,
+		.sck_port = GPIOB, .sck_pin = GPIO3,
+		.miso_port = GPIOB, .miso_pin = GPIO4,
+		.mosi_port = GPIOB, .mosi_pin = GPIO5,
+		.frame_port = GPIOA, .frame_pin = GPIO15,
+		.id_port = GPIOC, .id_pin = GPIO10,
+		.delay_timer = TIM7,
+		.delay_timer_freq_mhz = 1,
+		.control_prescaler = SPI_CR1_BR_FPCLK_DIV_16,
+		.data_prescaler = SPI_CR1_BR_FPCLK_DIV_16,
+	});
+
+	uxb_interface_init(&iface1);
+	uxb_interface_set_address(
+		&iface1,
+		(uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04},
+		(uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	);
+	uxb_master_locm3_add_interface(&uxb, &iface1);
+
+	uxb_slot_init(&slot1);
+	uxb_slot_set_slot_number(&slot1, 5);
+	uxb_slot_set_slot_buffer(&slot1, slot1_buffer, 1024);
+	uxb_slot_set_data_received(&slot1, uxb_data_received, NULL);
+	uxb_interface_add_slot(&iface1, &slot1);
+
+	uxb_slot_init(&descriptor_slot);
+	uxb_slot_set_slot_number(&descriptor_slot, 0);
+	uxb_slot_set_slot_buffer(&descriptor_slot, descriptor_slot_buffer, sizeof(descriptor_slot_buffer));
+	uxb_slot_set_data_received(&descriptor_slot, uxb_read_descriptor, NULL);
+	uxb_interface_add_slot(&iface1, &descriptor_slot);
+
+	/* Setup uxb exti interrupts. */
+	nvic_enable_irq(NVIC_EXTI15_10_IRQ);
+	rcc_periph_clock_enable(RCC_SYSCFG);
+	exti_select_source(EXTI15, GPIOA);
+	exti_set_trigger(EXTI15, EXTI_TRIGGER_FALLING);
+	exti_enable_request(EXTI15);
+
+}
+
+
+void exti15_10_isr(void) {
+	exti_reset_request(EXTI15);
+
+	exti_disable_request(EXTI15);
+	uxb_master_locm3_frame_irq(&uxb);
+	exti_enable_request(EXTI15);
+
 
 }
 
@@ -138,39 +264,18 @@ void dma_setup(void) {
 }
 
 
+void timer_sync_start(void) {
+	uint32_t current = timer_get_counter(TIM2);
+	uint32_t next = (current / ADC_BUFFER_SIZE / 30) * 30 * ADC_BUFFER_SIZE + 2 * 30 * ADC_BUFFER_SIZE;
+	printf("current=%d next=%d\n", current, next);
+	gpsdo_sync_start(&gpsdo, next);
+	// timer_set_oc_value(TIM2, TIM_OC1, next);
+
+
+}
+
+
 void timer_setup(void) {
-	timer_reset(TIM2);
-	timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-	timer_continuous_mode(TIM2);
-	timer_direction_up(TIM2);
-	timer_enable_break_main_output(TIM2);
-	timer_enable_update_event(TIM2);
-	timer_disable_preload(TIM2);
-	timer_set_prescaler(TIM2, 0);
-	timer_set_period(TIM2, ~(uint32_t)0);
-
-	/* GPS 1pps input used to measure the pulse period and adjust the VC/TCXO. */
-	timer_ic_set_input(TIM2, TIM_IC2, TIM_IC_IN_TI2);
-	timer_ic_set_filter(TIM2, TIM_IC2, TIM_IC_OFF);
-	/* Detecting 1PPS on the rising edge. */
-	timer_ic_set_polarity(TIM2, TIM_IC2, TIM_IC_RISING);
-	timer_ic_set_prescaler(TIM2, TIM_IC2, TIM_IC_PSC_OFF);
-	timer_ic_enable(TIM2, TIM_IC2);
-
-	/* CC2 irq to print 1PPS pulse period and adjust the VCTCXO. */
-	timer_enable_irq(TIM2, TIM_DIER_CC2IE);
-
-
-
-	timer_disable_oc_preload(TIM2, TIM_OC1);
-	timer_set_oc_mode(TIM2, TIM_OC1, TIM_OCM_PWM2);
-	timer_set_oc_value(TIM2, TIM_OC1, 1);
-	/* Not needed for synchronization. */
-	// timer_enable_oc_output(TIM2, TIM_OC1);
-
-	/* Synchronize TIM3 to a exact time. There is a 2 clock cycles delay between
-	 * OC3REF and TIM3 start. */
-	timer_set_master_mode(TIM2, TIM_CR2_MMS_COMPARE_OC1REF);
 
 	/* Initialize the TIM3, but does not enable it. */
 	timer_reset(TIM3);
@@ -192,6 +297,7 @@ void timer_setup(void) {
 	 * the trigger used to do ADC conversions. */
 	timer_set_master_mode(TIM3, TIM_CR2_MMS_UPDATE);
 
+	timer_sync_start();
 
 
 
@@ -224,7 +330,7 @@ void timer_setup(void) {
 	/* ADC configuration. */
 	rcc_periph_clock_enable(RCC_ADC12);
 
-	adc_set_sample_time_on_all_channels(ADC1, ADC_SMPR_SMP_1DOT5CYC);
+	adc_set_sample_time_on_all_channels(ADC1, ADC_SMPR_SMP_4DOT5CYC);
 	uint8_t channels[16] = {4};
 	adc_set_regular_sequence(ADC1, 1, channels);
 	/* Do not use ADc interrupt, use DMA instead. */
@@ -237,7 +343,7 @@ void timer_setup(void) {
 	ADC1_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
 
 	/* Configure the analog watchdog. */
-	ADC1_TR1 = (uint32_t)((2100 << 16) | 1800);
+	ADC1_TR1 = (uint32_t)((3000 << 16) | 1000);
 	ADC1_CFGR |= ADC_CFGR_AWD1EN;
 	// ADC1_IER |= ADC_IER_AWD1IE;
 
@@ -253,25 +359,16 @@ void timer_setup(void) {
 }
 
 
-void timer_sync_start(void) {
-	uint32_t current = timer_get_counter(TIM2);
-	uint32_t next = (current / ADC_BUFFER_SIZE / 30) * 30 * ADC_BUFFER_SIZE + 2 * 30 * ADC_BUFFER_SIZE;
-	printf("current=%d next=%d\n", current, next);
-	timer_set_oc_value(TIM2, TIM_OC1, next);
-
-
-}
-
 void print_buffer(void) {
 	uint32_t pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
 
-	printf("buffer \n");
+	printf("buffer=");
 
 	for (size_t i = pos + 1; i < ADC_BUFFER_SIZE; i++) {
-		printf("%d ", adc_buffer[i]);
+		printf("%04x", adc_buffer[i]);
 	}
 	for (size_t i = 0; i < pos; i++) {
-		printf("%d ", adc_buffer[i]);
+		printf("%04x", adc_buffer[i]);
 	}
 	printf("\n");
 
@@ -300,17 +397,31 @@ void tim1_cc_isr(void) {
 void tim2_isr(void) {
 	if (TIM_SR(TIM2) & TIM_SR_CC2IF) {
 		timer_clear_flag(TIM2, TIM_SR_CC2IF);
-		uint32_t ccr_new = TIM_CCR2(TIM2);
-		if (ccr_old == 0) {
-			ccr_old = ccr_new;
-			return;
+
+		gpsdo_1pps_irq_handler(&gpsdo);
+
+		// printf("%u ticks=%u out=%d error=%d phase_error=%d pps_setpoint=%u\n", timer_get_counter(TIM2), gpsdo.pps_time_ticks, gpsdo.pps_steer, (int32_t)gpsdo.pps_error, (int32_t)gpsdo.phase_error, gpsdo.pps_setpoint);
+	}
+	if (TIM_SR(TIM2) & TIM_SR_CC3IF) {
+		timer_clear_flag(TIM2, TIM_SR_CC3IF);
+
+		gpsdo_housekeeping_irq_handler(&gpsdo);
+		struct gpsdo_sync_stats stats;
+		gpsdo_get_sync_status(&gpsdo, &stats);
+		printf("gpsdo sync stats:\n");
+
+		printf("  phase error: %d ns\n", stats.phase_error);
+		printf("  period error: %d ns\n", stats.period_error);
+
+		const char *status_str = "?";
+		switch (stats.status) {
+			case GPSDO_SYNC_STATUS_UNKNOWN: status_str = "UNKNOWN"; break;
+			case GPSDO_SYNC_STATUS_ADJUSTING: status_str = "ADJUSTING"; break;
+			case GPSDO_SYNC_OK: status_str = "OK"; break;
 		}
+		printf("  sync status: %s\n", status_str);
 
-		uint32_t ccr_sample = ccr_new - ccr_old;
-		ccr_old = ccr_new;
 
-		printf("%u %u sps = %u\n", (unsigned int)ccr_new, (unsigned int)ccr_sample, (unsigned int)samples);
-		samples = 0;
 	}
 
 }

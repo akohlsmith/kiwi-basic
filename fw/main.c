@@ -6,6 +6,7 @@
 #include <libopencm3/stm32/timer.h>
 #include <libopencm3/stm32/adc.h>
 #include <libopencm3/stm32/usart.h>
+#include <libopencm3/stm32/dac.h>
 #include "board.h"
 
 
@@ -19,9 +20,13 @@ static void delay_simple(uint32_t d) {
 int main(void) {
 	gpio_setup();
 	usart_setup();
-	timer_setup();
 
-	printf("som tu\n");
+	/* Setup the GPSDO. */
+	gpsdo_init(&gpsdo, TIM2, TIM_IC2, 60000000, CHANNEL_1);
+	gpsdo_sync_enable(&gpsdo, TIM_OC1);
+	gpsdo_housekeeping_enable(&gpsdo, TIM_OC3);
+
+	timer_setup();
 
 	delay_simple(1000000);
 	while (true) {
@@ -58,6 +63,7 @@ int main(void) {
 		}
 
 		if (c == 's') {
+			timer_disable_counter(TIM3);
 			print_buffer();
 
 			timer_set_counter(TIM1, 0);
