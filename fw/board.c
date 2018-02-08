@@ -18,15 +18,15 @@
 #include "board.h"
 #include "gpsdo.h"
 #include "uxb_locm3.h"
-
-uint32_t ccr_old = 0;
-
-#define ADC_BUFFER_SIZE 4096
-uint16_t adc_buffer[ADC_BUFFER_SIZE];
-
-uint32_t samples = 0;
+#include "sampler.h"
 
 Gpsdo gpsdo;
+Sampler sampler;
+
+/** @todo sampler, move */
+uint32_t ccr_old = 0;
+
+/** @todo UXB related, move */
 UxbMasterLocm3 uxb;
 UxbInterface iface1;
 UxbSlot slot1;
@@ -48,6 +48,8 @@ const char *uxb_descriptor[] = {
 
 uint8_t descriptor_slot_buffer[64];
 
+
+
 static void delay_simple(uint32_t d) {
 	for (uint32_t i = 0; i < d; i++) {
 		__asm__("nop");
@@ -55,6 +57,7 @@ static void delay_simple(uint32_t d) {
 }
 
 
+/** @todo UXB related, move */
 static uxb_master_locm3_ret_t uxb_read_descriptor(void *context, uint8_t *buf, size_t len) {
 	uint8_t zero = 0;
 
@@ -77,9 +80,10 @@ static uxb_master_locm3_ret_t uxb_read_descriptor(void *context, uint8_t *buf, s
 }
 
 
+/** @todo UXB related, move */
 static uxb_master_locm3_ret_t uxb_data_received(void *context, uint8_t *buf, size_t len) {
 	// usart_send_blocking(USART1, 'A');
-	uxb_slot_send_data(&slot1, (uint8_t *)adc_buffer, 1024, true);
+	uxb_slot_send_data(&slot1, (uint8_t *)&sampler.buf[0].adc_buffer, 1024, true);
 	return UXB_MASTER_LOCM3_RET_OK;
 }
 
@@ -110,19 +114,16 @@ void gpio_setup(void) {
 	rcc_periph_clock_enable(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOB);
 	rcc_periph_clock_enable(RCC_GPIOC);
+	rcc_periph_clock_enable(RCC_GPIOD);
+	rcc_periph_clock_enable(RCC_GPIOE);
 	rcc_periph_clock_enable(RCC_USART1);
 	rcc_periph_clock_enable(RCC_TIM2);
-	rcc_periph_clock_enable(RCC_TIM3);
-	rcc_periph_clock_enable(RCC_DMA1);
-	rcc_periph_clock_enable(RCC_TIM1);
-	rcc_periph_clock_enable(RCC_TIM8);
 	rcc_periph_clock_enable(RCC_DAC1);
 
 	nvic_enable_irq(NVIC_TIM1_CC_IRQ);
 	nvic_enable_irq(NVIC_TIM2_IRQ);
 	nvic_enable_irq(NVIC_TIM3_IRQ);
 	nvic_enable_irq(NVIC_ADC1_2_IRQ);
-	nvic_enable_irq(NVIC_DMA1_CHANNEL1_IRQ);
 
 	// gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO5);
 	gpio_mode_setup(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO3);
@@ -137,6 +138,15 @@ void gpio_setup(void) {
 
 	/* ADC1, channel 4, no filter, fast channel. */
 	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO3);
+
+	/* ADC2, channel 4, no filter, fast channel. */
+	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO7);
+
+	/* ADC3, channel 2, no filter, fast channel. */
+	gpio_mode_setup(GPIOE, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO9);
+
+	/* ADC4, channel 2, no filter, fast channel. */
+	gpio_mode_setup(GPIOE, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO15);
 
 	/* VCTCXO steering, DAC output. */
 	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO4);
@@ -211,6 +221,7 @@ void exti15_10_isr(void) {
 }
 
 
+/* Debug output over USART1. */
 void usart_setup(void) {
 	usart_set_baudrate(USART1, 460800);
 	usart_set_databits(USART1, 8);
@@ -239,157 +250,12 @@ int _write(int file, char *ptr, int len) {
 }
 
 
-void dma_setup(void) {
-
-	/* DMA1 configuration, channel 1 for ADC1. */
-	dma_set_priority(DMA1, DMA_CHANNEL1, DMA_CCR_PL_VERY_HIGH);
-
-	dma_set_memory_size(DMA1, DMA_CHANNEL1, DMA_CCR_MSIZE_16BIT);
-	dma_set_peripheral_size(DMA1, DMA_CHANNEL1, DMA_CCR_PSIZE_16BIT);
-
-	dma_enable_memory_increment_mode(DMA1, DMA_CHANNEL1);
-	dma_disable_peripheral_increment_mode(DMA1, DMA_CHANNEL1);
-
- 	dma_set_read_from_peripheral(DMA1, DMA_CHANNEL1);
-
- 	dma_set_peripheral_address(DMA1, DMA_CHANNEL1, (uint32_t)(&ADC1_DR));
-	dma_set_memory_address(DMA1, DMA_CHANNEL1, (uint32_t)adc_buffer);
-
-	dma_set_number_of_data(DMA1, DMA_CHANNEL1, ADC_BUFFER_SIZE);
-	dma_enable_circular_mode(DMA1, DMA_CHANNEL1);
-
-	dma_enable_transfer_complete_interrupt(DMA1, DMA_CHANNEL1);
-	dma_enable_channel(DMA1, DMA_CHANNEL1);
-
-}
-
-
-void timer_sync_start(void) {
-	uint32_t current = timer_get_counter(TIM2);
-	uint32_t next = (current / ADC_BUFFER_SIZE / 30) * 30 * ADC_BUFFER_SIZE + 2 * 30 * ADC_BUFFER_SIZE;
-	printf("current=%d next=%d\n", current, next);
-	gpsdo_sync_start(&gpsdo, next);
-	// timer_set_oc_value(TIM2, TIM_OC1, next);
-
-
-}
-
-
-void timer_setup(void) {
-
-	/* Initialize the TIM3, but does not enable it. */
-	timer_reset(TIM3);
-	timer_set_mode(TIM3, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-	timer_continuous_mode(TIM3);
-	timer_direction_up(TIM3);
-	timer_disable_preload(TIM3);
-	timer_enable_update_event(TIM3);
-	timer_set_prescaler(TIM3, 0);
-	timer_set_period(TIM3, 29); /* 14 */
-	// timer_enable_irq(TIM3, TIM_DIER_UIE);
-
-	/* Configure it as a slave instead and wait for TIM2. */
-	timer_slave_set_polarity(TIM3, TIM_ET_RISING);
-	timer_slave_set_trigger(TIM3, TIM_SMCR_TS_ITR1);
-	timer_slave_set_mode(TIM3, TIM_SMCR_SMS_TM);
-
-	/* Set update event as a TRGO output on TIM3 - this will be
-	 * the trigger used to do ADC conversions. */
-	timer_set_master_mode(TIM3, TIM_CR2_MMS_UPDATE);
-
-	timer_sync_start();
-
-
-
-
-
-	/* Configure timer 1 and timer 8 to receive events from the analog watchdogs. */
-	timer_reset(TIM1);
-	timer_set_mode(TIM1, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-	timer_continuous_mode(TIM1);
-	timer_direction_up(TIM1);
-	timer_disable_preload(TIM1);
-	timer_enable_update_event(TIM1);
-	timer_set_prescaler(TIM1, 0);
-	timer_set_period(TIM1, 65535);
-	/* Do not enable the timer, configure enable slave mode instead. */
-	timer_slave_set_polarity(TIM1, TIM_ET_RISING);
-	TIM1_SMCR |= TIM_SMCR_ETF_DTS_DIV_4_N_6;
-	timer_slave_set_trigger(TIM1, TIM_SMCR_TS_ETRF);
-	timer_slave_set_mode(TIM1, TIM_SMCR_SMS_TM);
-	TIM1_OR |= TIM1_ETR_ADC1_RMP_AWD1;
-	// timer_enable_counter(TIM1);
-
-	timer_disable_oc_preload(TIM1, TIM_OC1);
-	timer_set_oc_value(TIM1, TIM_OC1, 30 * 2048 - 1);
-	timer_enable_irq(TIM1, TIM_DIER_CC1IE);
-
-
-
-
-	/* ADC configuration. */
-	rcc_periph_clock_enable(RCC_ADC12);
-
-	adc_set_sample_time_on_all_channels(ADC1, ADC_SMPR_SMP_4DOT5CYC);
-	uint8_t channels[16] = {4};
-	adc_set_regular_sequence(ADC1, 1, channels);
-	/* Do not use ADc interrupt, use DMA instead. */
-	// ADC1_IER |= ADC_IER_EOSIE;
-	ADC12_CCR |= ADC_CCR_CKMODE_DIV1;
-	ADC1_CFGR |= ADC_CFGR_EXTEN_RISING_EDGE;
-	ADC1_CFGR |= ADC_CFGR_EXTSEL_EXT4;
-
-	/* Enable DMA circular mode. */
-	ADC1_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
-
-	/* Configure the analog watchdog. */
-	ADC1_TR1 = (uint32_t)((3000 << 16) | 1000);
-	ADC1_CFGR |= ADC_CFGR_AWD1EN;
-	// ADC1_IER |= ADC_IER_AWD1IE;
-
-
-	dma_setup();
-
-	adc_power_on(ADC1);
-	ADC1_CR |= ADC_CR_ADSTART;
-
-
-	timer_enable_counter(TIM2);
-
-}
-
-
-void print_buffer(void) {
-	uint32_t pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
-
-	printf("buffer=");
-
-	for (size_t i = pos + 1; i < ADC_BUFFER_SIZE; i++) {
-		printf("%04x", adc_buffer[i]);
-	}
-	for (size_t i = 0; i < pos; i++) {
-		printf("%04x", adc_buffer[i]);
-	}
-	printf("\n");
-
-}
 
 void tim1_cc_isr(void) {
 	if (TIM_SR(TIM1) & TIM_SR_CC1IF) {
-		/* Disable triggering of the ADC. */
-		timer_disable_counter(TIM3);
-
-		timer_disable_irq(TIM1, TIM_DIER_CC1IE);
-		timer_clear_flag(TIM1, TIM_SR_CC1IF);
-		timer_disable_counter(TIM1);
-
-		print_buffer();
-
-		timer_set_counter(TIM1, 0);
-		timer_enable_irq(TIM1, TIM_DIER_CC1IE);
-
-		dma_setup();
-		timer_sync_start();
+		sampler_stop(&sampler);
+		sampler_print_buffer(&sampler);
+		sampler_start(&sampler);
 	}
 }
 
@@ -408,6 +274,8 @@ void tim2_isr(void) {
 		gpsdo_housekeeping_irq_handler(&gpsdo);
 		struct gpsdo_sync_stats stats;
 		gpsdo_get_sync_status(&gpsdo, &stats);
+
+		/*
 		printf("gpsdo sync stats:\n");
 
 		printf("  phase error: %d ns\n", stats.phase_error);
@@ -420,7 +288,7 @@ void tim2_isr(void) {
 			case GPSDO_SYNC_OK: status_str = "OK"; break;
 		}
 		printf("  sync status: %s\n", status_str);
-
+		*/
 
 	}
 
@@ -445,7 +313,7 @@ void tim3_isr(void) {
 
 void adc1_2_isr(void) {
 
-	// printf("%08x\n", ADC1_ISR);
+	/* No ADC watchdog interrupt, not needed. */
 	if (ADC1_ISR & ADC_ISR_AWD1) {
 		ADC1_ISR |= ADC_ISR_AWD1;
 		printf("awd %d\n", ADC1_DR);
@@ -462,17 +330,27 @@ void adc1_2_isr(void) {
 void dma1_channel1_isr(void) {
 	if (dma_get_interrupt_flag(DMA1, DMA_CHANNEL1, DMA_TCIF)) {
 		dma_clear_interrupt_flags(DMA1, DMA_CHANNEL1, DMA_TCIF);
-
-		// printf("buffer = ");
-		// for (size_t i = 0; i < ADC_BUFFER_SIZE; i++) {
-			// if (adc_buffer[i] > 3000) {
-				// printf("t\n");
-				// break;
-			// }
-			// printf("%d ", adc_buffer[i]);
-		// }
-		samples += ADC_BUFFER_SIZE;
-		// printf("\n");
+		sampler_dma_completed_handler(&sampler, 0);
 	}
+}
 
+void dma2_channel1_isr(void) {
+	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL1, DMA_TCIF)) {
+		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL1, DMA_TCIF);
+		sampler_dma_completed_handler(&sampler, 1);
+	}
+}
+
+void dma2_channel5_isr(void) {
+	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL5, DMA_TCIF)) {
+		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL5, DMA_TCIF);
+		sampler_dma_completed_handler(&sampler, 2);
+	}
+}
+
+void dma2_channel2_isr(void) {
+	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL2, DMA_TCIF)) {
+		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL2, DMA_TCIF);
+		sampler_dma_completed_handler(&sampler, 3);
+	}
 }

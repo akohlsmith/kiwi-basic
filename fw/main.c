@@ -7,6 +7,7 @@
 #include <libopencm3/stm32/adc.h>
 #include <libopencm3/stm32/usart.h>
 #include <libopencm3/stm32/dac.h>
+#include <libopencm3/stm32/dma.h>
 #include "board.h"
 
 
@@ -26,53 +27,45 @@ int main(void) {
 	gpsdo_sync_enable(&gpsdo, TIM_OC1);
 	gpsdo_housekeeping_enable(&gpsdo, TIM_OC3);
 
-	timer_setup();
 
 	delay_simple(1000000);
+
+	sampler_init(&sampler, 60000000, 2000000);
+	sampler_start(&sampler);
+
 	while (true) {
 
 		uint16_t c = usart_recv_blocking(USART1);
 
 		if (c == 't') {
-			// gpio_set(GPIOA, GPIO0);
-			// gpio_set(GPIOC, GPIO3);
-			// delay_simple(40);
-			// gpio_clear(GPIOA, GPIO0);
-			// gpio_clear(GPIOC, GPIO3);
-			// delay_simple(2000000);
-
 			uint32_t cnt1 = TIM1_CNT;
 			uint32_t cnt2 = TIM2_CNT;
 			uint32_t cnt3 = TIM3_CNT;
+			uint32_t pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
 
-			/* Re-sync. */
-			// timer_disable_counter(TIM3);
-			// timer_set_oc_value(TIM2, TIM_OC1, cnt2 + 1000);
-
-			printf("tim2=%u tim3=%u tim1=%u samples=%u\n", cnt2, cnt3, cnt1, samples);
-			// ADC1_IER |= ADC_IER_AWD2IE;
-
-			// for (size_t i = 0; i < ADC_BUFFER_SIZE; i++) {
-				// if (adc_buffer[i] > 3000) {
-					// printf("t\n");
-					// break;
-				// }
-				// printf("%d ", adc_buffer[i]);
-			// }
+			// printf("tim2 mod 30 = %lu tim3 = %lu diff = %ld\n", cnt2 % 30, cnt3, (int32_t)(cnt2 % 30 - cnt3));
+			printf("tim2 div 30 mod SIZE = %lu DMA pos = %lu diff = %ld\n", (cnt2 / 30) % ADC_BUFFER_SIZE, pos, (int32_t)((cnt2 / 30) % ADC_BUFFER_SIZE - pos));
+			printf("DMA_ISR = %08x\n", DMA_ISR(DMA1));
+			printf("ADC_ISR = %08x\n", ADC_ISR(ADC1));
 
 		}
 
 		if (c == 's') {
-			timer_disable_counter(TIM3);
-			print_buffer();
-
-			timer_set_counter(TIM1, 0);
-			timer_enable_irq(TIM1, TIM_DIER_CC1IE);
-
-			dma_setup();
-			timer_sync_start();
+			sampler_stop(&sampler);
+			sampler_print_buffer(&sampler);
+			sampler_start(&sampler);
 		}
 
+		if (c == 'b') {
+
+			for (size_t i = 0; i < 4; i++) {
+				uint32_t now = TIM2_CNT;
+				uint32_t start = sampler.buf[i].buffer_start_time;
+				uint32_t pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
+				printf("now = %lu buf[%u].start_time = %lu pos = %lu dma pos = %lu\n", now, i, start, (now - start) / 30, pos);
+			}
+
+		}
 
 	}
 

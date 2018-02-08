@@ -71,7 +71,8 @@ gpsdo_ret_t gpsdo_init(Gpsdo *self, uint32_t timer, uint32_t pps_ic, uint32_t ti
 	timer_set_prescaler(self->timer, 0);
 
 	/* Set the maximum possible period. */
-	timer_set_period(self->timer, (~(uint32_t)0) / self->timer_freq_hz * self->timer_freq_hz);
+	self->timer_period = (~(uint32_t)0) / self->timer_freq_hz * self->timer_freq_hz - self->timer_freq_hz;
+	timer_set_period(self->timer, self->timer_period);
 
 	switch (self->pps_ic) {
 		case TIM_IC1:
@@ -112,6 +113,8 @@ gpsdo_ret_t gpsdo_init(Gpsdo *self, uint32_t timer, uint32_t pps_ic, uint32_t ti
 	/* Enable the DAC. */
 	dac_enable(self->dac);
 	dac_load_data_buffer_single(0, RIGHT12, self->dac);
+
+	timer_enable_counter(self->timer);
 
 	return GPSDO_RET_OK;
 }
@@ -269,6 +272,8 @@ gpsdo_ret_t gpsdo_1pps_irq_handler(Gpsdo *self) {
 
 		/* Also, reschedule the housekeeping as the counter value has changed. */
 		gpsdo_housekeeping_schedule(self, 2000);
+
+		printf("step\n");
 
 		/* There is not much to do actually, continue when the next
 		 * 1PPS signal arrives. */

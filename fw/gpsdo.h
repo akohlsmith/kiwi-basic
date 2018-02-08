@@ -92,6 +92,7 @@ typedef struct {
 	/* Gpsdo runs on a 32bit timer. A libopencm3 timer reference is needed. */
 	uint32_t timer;
 	uint32_t timer_freq_hz;
+	uint32_t timer_period;
 
 	/* GPS 1PPS signal is connected to a input capture line. */
 	uint32_t pps_ic;
