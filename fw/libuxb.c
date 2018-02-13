@@ -29,15 +29,15 @@
 #include <libopencm3/stm32/usart.h>
 #include <libopencm3/stm32/rcc.h>
 
-#include "uxb_locm3.h"
+#include "libuxb.h"
 
 
-static uint16_t timer_wait_init(UxbMasterLocm3 *self) {
+static uint16_t timer_wait_init(LibUxbBus *self) {
 	return timer_get_counter(self->config.delay_timer);
 }
 
 
-static void timer_wait(UxbMasterLocm3 *self, uint16_t t, uint16_t interval) {
+static void timer_wait(LibUxbBus *self, uint16_t t, uint16_t interval) {
 	interval *= self->config.delay_timer_freq_mhz;
 
 	uint16_t diff;
@@ -49,7 +49,7 @@ static void timer_wait(UxbMasterLocm3 *self, uint16_t t, uint16_t interval) {
 }
 
 
-static bool timer_wait_check(UxbMasterLocm3 *self, uint16_t t, uint16_t interval) {
+static bool timer_wait_check(LibUxbBus *self, uint16_t t, uint16_t interval) {
 	interval *= self->config.delay_timer_freq_mhz;
 	uint16_t n = timer_get_counter(self->config.delay_timer);
 	/* uint16_t subtraction with overflow. */
@@ -63,7 +63,7 @@ static bool timer_wait_check(UxbMasterLocm3 *self, uint16_t t, uint16_t interval
  *
  * @return void, by design it cannot fail if the peripheral clock and timer is running properly.
  */
-static void reconfigure_spi_port(UxbMasterLocm3 *self, bool transmit) {
+static void reconfigure_spi_port(LibUxbBus *self, bool transmit) {
 
 	if (transmit) {
 		/* Inter frame-group minimum delay. */
@@ -104,7 +104,7 @@ static void reconfigure_spi_port(UxbMasterLocm3 *self, bool transmit) {
 }
 
 
-static uxb_master_locm3_ret_t release_spi_port(UxbMasterLocm3 *self, bool wait_for_bus_free) {
+static uxb_master_locm3_ret_t release_spi_port(LibUxbBus *self, bool wait_for_bus_free) {
 	/* Make the port idle, enable pull resistor to define the idle state and turn off the SPI port. */
 	gpio_mode_setup(self->config.miso_port, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN, self->config.miso_pin);
 	gpio_mode_setup(self->config.mosi_port, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN, self->config.mosi_pin);
@@ -138,7 +138,7 @@ static uxb_master_locm3_ret_t release_spi_port(UxbMasterLocm3 *self, bool wait_f
 }
 
 
-static void spi_send_data(UxbMasterLocm3 *self, uint8_t *buf, size_t len) {
+static void spi_send_data(LibUxbBus *self, uint8_t *buf, size_t len) {
 	for (size_t i = 0; i < len; i++) {
 		while (!(SPI_SR(self->config.spi_port) & SPI_SR_TXE)) {
 			;
@@ -156,11 +156,11 @@ static void spi_send_data(UxbMasterLocm3 *self, uint8_t *buf, size_t len) {
 
 	/* Respect inter-frame delay. */
 	uint16_t t = timer_wait_init(self);
-	timer_wait(self, t, 50);
+	timer_wait(self, t, 100);
 }
 
 
-static uxb_master_locm3_ret_t spi_recv_data(UxbMasterLocm3 *self, uint8_t *buf, size_t len, uint16_t start_timeout, uint16_t byte_timeout) {
+static uxb_master_locm3_ret_t spi_recv_data(LibUxbBus *self, uint8_t *buf, size_t len, uint16_t start_timeout, uint16_t byte_timeout) {
 
 	uint16_t t = timer_wait_init(self);
 	while (!(SPI_SR(self->config.spi_port) & SPI_SR_RXNE)) {
@@ -272,7 +272,7 @@ static uxb_master_locm3_ret_t uxb_build_data_control(uint8_t *buf, uint16_t len,
 }
 
 
-static enum uxb_control_frame_type get_control_frame_type(uint8_t *frame) {
+static enum uxb_frame_type get_control_frame_type(uint8_t *frame) {
 	if ((frame[0] << 8 | frame[1]) != CONTROL_FRAME_MAGIC) {
 		return UXB_FRAME_TYPE_UNKNOWN;
 	}
@@ -292,9 +292,9 @@ static uint16_t get_data_len(uint8_t *frame) {
 }
 
 
-uxb_master_locm3_ret_t uxb_master_locm3_init(UxbMasterLocm3 *self, const struct uxb_master_locm3_config *config) {
+uxb_master_locm3_ret_t libuxb_bus_init(LibUxbBus *self, const struct uxb_master_locm3_config *config) {
 
-	memset(self, 0, sizeof(UxbMasterLocm3));
+	memset(self, 0, sizeof(LibUxbBus));
 	memcpy(&self->config, config, sizeof(struct uxb_master_locm3_config));
 
 	/* Setup SPI pin mode and AF number, but does not connecte them to the AF, leave as input. */
@@ -312,6 +312,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_init(UxbMasterLocm3 *self, const struct 
 
 	gpio_mode_setup(self->config.id_port, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, self->config.id_pin);
 	gpio_set_output_options(self->config.id_port, GPIO_OTYPE_OD, GPIO_OSPEED_2MHZ, self->config.id_pin);
+	gpio_set(self->config.id_port, self->config.id_pin);
 
 	SPI_CR1(self->config.spi_port) |= SPI_CR1_BIDIMODE;
 	/* Data frame format is 8 bit (default). */
@@ -334,7 +335,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_init(UxbMasterLocm3 *self, const struct 
 }
 
 
-uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
+uxb_master_locm3_ret_t libuxb_bus_frame_irq(LibUxbBus *self) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
@@ -351,7 +352,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 
 	/* Deselect all interfaces. */
 	{
-		UxbInterface *i = self->interfaces;
+		LibUxbDevice *i = self->devices;
 		while (i != NULL) {
 			i->selected = false;
 			i = i->next;
@@ -370,7 +371,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 			case UXB_FRAME_TYPE_SEL_SINGLE: {
 
 				/* Find an interface with a corresponding address. */
-				UxbInterface *i = self->interfaces;
+				LibUxbDevice *i = self->devices;
 				while (i != NULL) {
 					if (!memcmp(&(self->control_frame[4]), &(i->local_address), UXB_INTERFACE_ADDRESS_LEN)) {
 						i->selected = true;
@@ -382,7 +383,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 			}
 
 			case UXB_FRAME_TYPE_SEL_PREV: {
-				self->previous_interface->selected = true;
+				self->previous_device->selected = true;
 				break;
 
 			}
@@ -390,16 +391,16 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 			case UXB_FRAME_TYPE_ASSERT_ID: {
 
 				/* Find the first selected interface. */
-				UxbInterface *selected_interface = NULL;
-				UxbInterface *i = self->interfaces;
+				LibUxbDevice *selected_device = NULL;
+				LibUxbDevice *i = self->devices;
 				while (i != NULL) {
 					if (i->selected) {
-						selected_interface = i;
+						selected_device = i;
 						break;
 					}
 					i = i->next;
 				}
-				if (selected_interface != NULL) {
+				if (selected_device != NULL) {
 					gpio_clear(self->config.id_port, self->config.id_pin);
 				}
 
@@ -419,16 +420,16 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 			case UXB_FRAME_TYPE_DATA: {
 
 				/* Find the first selected interface. */
-				UxbInterface *selected_interface = NULL;
-				UxbInterface *i = self->interfaces;
+				LibUxbDevice *selected_device = NULL;
+				LibUxbDevice *i = self->devices;
 				while (i != NULL) {
 					if (i->selected) {
-						selected_interface = i;
+						selected_device = i;
 						break;
 					}
 					i = i->next;
 				}
-				if (selected_interface == NULL) {
+				if (selected_device == NULL) {
 					ret = UXB_MASTER_LOCM3_RET_NO_SELECT;
 					goto err;
 				}
@@ -437,8 +438,8 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 				uint16_t len = get_data_len(self->control_frame);
 
 
-				UxbSlot *selected_slot = NULL;
-				UxbSlot *s = selected_interface->slots;
+				LibUxbSlot *selected_slot = NULL;
+				LibUxbSlot *s = selected_device->slots;
 				while (s != NULL) {
 					if (s->slot_number == slot) {
 						selected_slot = s;
@@ -475,6 +476,7 @@ uxb_master_locm3_ret_t uxb_master_locm3_frame_irq(UxbMasterLocm3 *self) {
 				}
 
 				/* This is the single exit point without an error (full frame was received correctly). */
+				release_spi_port(self, false);
 				return UXB_MASTER_LOCM3_RET_OK;
 			}
 
@@ -494,20 +496,20 @@ err:
 }
 
 
-uxb_master_locm3_ret_t uxb_master_locm3_add_interface(UxbMasterLocm3 *self, UxbInterface *i) {
+uxb_master_locm3_ret_t libuxb_bus_add_device(LibUxbBus *self, LibUxbDevice *i) {
 	if (self == NULL || i == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
 
 	i->parent = self;
-	i->next = self->interfaces;
-	self->interfaces = i;
+	i->next = self->devices;
+	self->devices = i;
 
 	return UXB_MASTER_LOCM3_RET_OK;
 }
 
 
-uxb_master_locm3_ret_t uxb_master_locm3_check_id(UxbMasterLocm3 *self, uint8_t id[UXB_INTERFACE_ADDRESS_LEN], bool *result) {
+uxb_master_locm3_ret_t libuxb_bus_check_id(LibUxbBus *self, uint8_t id[UXB_INTERFACE_ADDRESS_LEN], bool *result) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
@@ -523,6 +525,10 @@ uxb_master_locm3_ret_t uxb_master_locm3_check_id(UxbMasterLocm3 *self, uint8_t i
 	uxb_build_id_assert_control(frame);
 	spi_send_data(self, frame, 12);
 
+	/* Send the frame two times to allow the ID signal to stabilize. */
+	/** @todo meh. */
+	spi_send_data(self, frame, 12);
+
 	*result = !gpio_get(self->config.id_port, self->config.id_pin);
 
 	uxb_build_nop_control(frame);
@@ -535,18 +541,36 @@ uxb_master_locm3_ret_t uxb_master_locm3_check_id(UxbMasterLocm3 *self, uint8_t i
 }
 
 
-uxb_master_locm3_ret_t uxb_interface_init(UxbInterface *self) {
+uxb_master_locm3_ret_t libuxb_bus_query_device_by_id(LibUxbBus *self, uint8_t id[UXB_INTERFACE_ADDRESS_LEN], LibUxbDevice **result) {
+	if (self == NULL || result == NULL) {
+		return UXB_MASTER_LOCM3_RET_FAILED;
+	}
+
+	LibUxbDevice *d = self->devices;
+	while (d != NULL) {
+		if (!memcmp(id, d->remote_address, UXB_INTERFACE_ADDRESS_LEN)) {
+			*result = d;
+			return UXB_MASTER_LOCM3_RET_OK;
+		}
+		d = d->next;
+	}
+
+	return UXB_MASTER_LOCM3_RET_FAILED;
+}
+
+
+uxb_master_locm3_ret_t libuxb_device_init(LibUxbDevice *self) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
 
-	memset(self, 0, sizeof(UxbInterface));
+	memset(self, 0, sizeof(LibUxbDevice));
 
 	return UXB_MASTER_LOCM3_RET_OK;
 }
 
 
-uxb_master_locm3_ret_t uxb_interface_add_slot(UxbInterface *self, UxbSlot *s) {
+uxb_master_locm3_ret_t libuxb_device_add_slot(LibUxbDevice *self, LibUxbSlot *s) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
@@ -559,7 +583,7 @@ uxb_master_locm3_ret_t uxb_interface_add_slot(UxbInterface *self, UxbSlot *s) {
 }
 
 
-uxb_master_locm3_ret_t uxb_interface_set_address(UxbInterface *self, const uint8_t local_address[UXB_INTERFACE_ADDRESS_LEN], const uint8_t remote_address[UXB_INTERFACE_ADDRESS_LEN]) {
+uxb_master_locm3_ret_t libuxb_device_set_address(LibUxbDevice *self, const uint8_t local_address[UXB_INTERFACE_ADDRESS_LEN], const uint8_t remote_address[UXB_INTERFACE_ADDRESS_LEN]) {
 	if (self == NULL || local_address == NULL || remote_address == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
@@ -571,18 +595,18 @@ uxb_master_locm3_ret_t uxb_interface_set_address(UxbInterface *self, const uint8
 }
 
 
-uxb_master_locm3_ret_t uxb_slot_init(UxbSlot *self) {
+uxb_master_locm3_ret_t libuxb_slot_init(LibUxbSlot *self) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
 
-	memset(self, 0, sizeof(UxbSlot));
+	memset(self, 0, sizeof(LibUxbSlot));
 
 	return UXB_MASTER_LOCM3_RET_OK;
 }
 
 
-uxb_master_locm3_ret_t uxb_slot_set_slot_number(UxbSlot *self, uint8_t slot_number) {
+uxb_master_locm3_ret_t libuxb_slot_set_slot_number(LibUxbSlot *self, uint8_t slot_number) {
 	/* Slot number 0 is reserved for the interface descriptor. */
 	if (self == NULL || slot_number == 0) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
@@ -594,7 +618,7 @@ uxb_master_locm3_ret_t uxb_slot_set_slot_number(UxbSlot *self, uint8_t slot_numb
 }
 
 
-uxb_master_locm3_ret_t uxb_slot_set_slot_buffer(UxbSlot *self, uint8_t *buf, size_t size) {
+uxb_master_locm3_ret_t libuxb_slot_set_slot_buffer(LibUxbSlot *self, uint8_t *buf, size_t size) {
 	/* The buffer can be NULL, in this case no data can be received or sent. The slot
 	 * can be still used for polling/command execution. */
 	if (self == NULL) {
@@ -608,7 +632,7 @@ uxb_master_locm3_ret_t uxb_slot_set_slot_buffer(UxbSlot *self, uint8_t *buf, siz
 }
 
 
-uxb_master_locm3_ret_t uxb_slot_set_data_received(UxbSlot *self, uxb_master_locm3_ret_t (*data_received)(void *context, uint8_t *buf, size_t len), void *context) {
+uxb_master_locm3_ret_t libuxb_slot_set_data_received(LibUxbSlot *self, uxb_master_locm3_ret_t (*data_received)(void *context, uint8_t *buf, size_t len), void *context) {
 	if (self == NULL) {
 		return UXB_MASTER_LOCM3_RET_FAILED;
 	}
@@ -620,11 +644,11 @@ uxb_master_locm3_ret_t uxb_slot_set_data_received(UxbSlot *self, uxb_master_locm
 }
 
 
-uxb_master_locm3_ret_t uxb_slot_send_data(UxbSlot *self, const uint8_t *buf, size_t len, bool response) {
-	UxbInterface *interface = self->parent;
-	UxbMasterLocm3 *master = interface->parent;
+uxb_master_locm3_ret_t libuxb_slot_send_data(LibUxbSlot *self, const uint8_t *buf, size_t len, bool response) {
+	LibUxbDevice *device = self->parent;
+	LibUxbBus *bus = device->parent;
 
-	master->ignore_rx = true;
+	bus->ignore_rx = true;
 
 	/* Copy data to the slot buffer first. */
 	if (len > self->size) {
@@ -635,26 +659,26 @@ uxb_master_locm3_ret_t uxb_slot_send_data(UxbSlot *self, const uint8_t *buf, siz
 
 	/** @todo compute crc */
 
-	reconfigure_spi_port(master, true);
+	reconfigure_spi_port(bus, true);
 
-	spi_set_baudrate_prescaler(master->config.spi_port, master->config.control_prescaler);
+	spi_set_baudrate_prescaler(bus->config.spi_port, bus->config.control_prescaler);
 	uint8_t frame[12];
 	if (response) {
 		uxb_build_select_response_control(frame);
 	} else {
-		uxb_build_select_single_control(frame, interface->remote_address, false);
-		master->previous_interface = interface;
+		uxb_build_select_single_control(frame, device->remote_address, false);
+		bus->previous_device = device;
 	}
-	spi_send_data(master, frame, 12);
+	spi_send_data(bus, frame, 12);
 
 	uxb_build_data_control(frame, self->len, self->slot_number, 0);
-	spi_send_data(master, frame, 12);
+	spi_send_data(bus, frame, 12);
 
-	spi_set_baudrate_prescaler(master->config.spi_port, master->config.data_prescaler);
-	spi_send_data(master, self->buffer, self->len);
-	release_spi_port(master, false);
+	spi_set_baudrate_prescaler(bus->config.spi_port, bus->config.data_prescaler);
+	spi_send_data(bus, self->buffer, self->len);
+	release_spi_port(bus, false);
 
-	master->ignore_rx = false;
+	bus->ignore_rx = false;
 
 	return UXB_MASTER_LOCM3_RET_OK;
 }
@@ -662,7 +686,7 @@ uxb_master_locm3_ret_t uxb_slot_send_data(UxbSlot *self, const uint8_t *buf, siz
 
 
 
-uxb_master_locm3_ret_t uxb_slot_receive_data(UxbSlot *self) {
+uxb_master_locm3_ret_t libuxb_slot_receive_data(LibUxbSlot *self) {
 	(void)self;
 
 	return UXB_MASTER_LOCM3_RET_OK;

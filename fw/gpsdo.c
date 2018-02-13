@@ -24,9 +24,10 @@
  */
 
 
-#include "stdint.h"
-#include "stdbool.h"
-#include "stdlib.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 #include <libopencm3/stm32/timer.h>
 #include <libopencm3/stm32/dac.h>
@@ -360,6 +361,8 @@ gpsdo_ret_t gpsdo_housekeeping_irq_handler(Gpsdo *self) {
 	/* Erase the pps_new variable to be able to detect if a 1PPS pulse
 	 * arrived when the housekeeping is called the next time. */
 	self->pps_new = 0;
+
+	return GPSDO_RET_OK;
 }
 
 

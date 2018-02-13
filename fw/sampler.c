@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, Marek Koza (qyx@krtko.org)
+ * Copyright (c) 2018, Marek Koza (qyx@krtko.org)
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -38,51 +38,57 @@
 #include "sampler.h"
 #include "board.h"
 
+/* Documentation in this file is very verbose as the synchronized sampling
+ * is quite complex. */
+
+/** @todo The sampler does not use any fifo buffer to save the sampled data yet. */
 
 
-sampler_ret_t sampler_init(Sampler *self, uint32_t timer_freq_hz, uint32_t adc_freq_hz) {
+static sampler_ret_t sampler_init_clocks(Sampler *self) {
 	if (self == NULL) {
-		return SAMPLER_RET_FAILED;
+		return SAMPLER_RET_BAD_ARG;
 	}
 
 	/* Enable DMA clocks. */
 	rcc_periph_clock_enable(RCC_DMA1);
 	rcc_periph_clock_enable(RCC_DMA2);
 
+	/* Using only DMA1/channel1 transfer completed interrupt. Other channel interrupts
+	 * are not needed because all channels run in sync. */
 	nvic_enable_irq(NVIC_DMA1_CHANNEL1_IRQ);
-	nvic_enable_irq(NVIC_DMA2_CHANNEL1_IRQ);
-	nvic_enable_irq(NVIC_DMA2_CHANNEL5_IRQ);
-	nvic_enable_irq(NVIC_DMA2_CHANNEL2_IRQ);
 
-
-	/* Enable timer clocks. */
+	/* Enable timer clocks. TIM3 is used as a trigger for ADC1, ADC2, ADC3 and ADC4. */
 	rcc_periph_clock_enable(RCC_TIM3);
+	/* TIM1 and TIM8 are triggered by the analog watchdog(s) and their capture/compare
+	 * interrupt stops sampling. */
 	rcc_periph_clock_enable(RCC_TIM1);
 	rcc_periph_clock_enable(RCC_TIM8);
 
-	self->adc_freq_hz = adc_freq_hz;
-	self->timer_freq_hz = timer_freq_hz;
+	/* Cannot return error. */
+	return SAMPLER_RET_OK;
+}
+
+
+static sampler_ret_t sampler_init_adc_trigger_clock(Sampler *self) {
 
 	/* Initialize the TIM3, but does not enable it. TIM3 will be used to
-	 * trigger ADc conversions on all channels simultaneously. */
+	 * trigger ADC conversions on all channels simultaneously. */
 	timer_reset(TIM3);
 	timer_set_mode(TIM3, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
 	timer_continuous_mode(TIM3);
 	timer_direction_up(TIM3);
-	timer_disable_preload(TIM3);
-	timer_enable_update_event(TIM3);
 
-	/* We are counting up at the maximum speed, no prescaler. */
+	/* We are counting up at the maximum speed (self->timer_freq_hz), no prescaler. */
 	timer_set_prescaler(TIM3, 0);
 
 	/* Set the timer period to be the same as the ADC sampling frequency. */
 	timer_set_period(TIM3, self->timer_freq_hz / self->adc_freq_hz - 1);
 
-	/** @todo do we need the update interrupt? disabled now. */
-	// timer_enable_irq(TIM3, TIM_DIER_UIE);
+	/* Generate an update event. */
+	TIM1_EGR |= TIM_EGR_UG;
 
-	/* Configure it as a slave instead and wait for TIM2. TIM2 is run by the
-	 * GPSDO and synced to the GPS clock. */
+	/* Do not enable the timer. Configure it as a slave instead and wait for TIM2.
+	 * TIM2 is run by the GPSDO and synced to the GPS clock. */
 	timer_slave_set_polarity(TIM3, TIM_ET_RISING);
 	timer_slave_set_trigger(TIM3, TIM_SMCR_TS_ITR1);
 	timer_slave_set_mode(TIM3, TIM_SMCR_SMS_TM);
@@ -91,221 +97,148 @@ sampler_ret_t sampler_init(Sampler *self, uint32_t timer_freq_hz, uint32_t adc_f
 	 * the trigger used to do ADC conversions. */
 	timer_set_master_mode(TIM3, TIM_CR2_MMS_UPDATE);
 
-	/* Configure timer 1 and timer 8 to receive events from the analog watchdogs. */
+	return SAMPLER_RET_OK;
+}
+
+
+/* Configure timer 1 and timer 8 to receive events from the analog watchdogs. */
+static sampler_ret_t sampler_init_triggers(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	/* TIM1 is counting up at the sampling speed. */
 	timer_reset(TIM1);
 	timer_set_mode(TIM1, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
 	timer_continuous_mode(TIM1);
 	timer_direction_up(TIM1);
-	timer_disable_preload(TIM1);
-	timer_enable_update_event(TIM1);
-
-	/* We are counting at the sampling frequency. */
-	/** @todo wtf, prescaler setting doesn't not work. */
-	timer_set_prescaler(TIM1, 0);
+	timer_set_prescaler(TIM1, self->timer_freq_hz / self->adc_freq_hz - 1);
+	/* The maximum usable period is actually the same as the buffer size but
+	 * we are using 2^16-1. */
 	timer_set_period(TIM1, 65535);
+
+	/* And update from shadow registers. */
+	TIM1_EGR |= TIM_EGR_UG;
 
 	/* Do not enable the timer, configure slave mode instead. The timer waits with
 	 * its counter at 0 for an external event. It is started when the analog watchdog
-	 * detects signal with configured parameters. */
+	 * detects a signal with configured parameters. */
 	timer_slave_set_polarity(TIM1, TIM_ET_RISING);
-	TIM1_SMCR |= TIM_SMCR_ETF_DTS_DIV_4_N_6;
+
+	/* The ETR input supports some basic filters. */
+	/** @todo make the filter configurable */
+	// TIM1_SMCR |= TIM_SMCR_ETF_DTS_DIV_4_N_6;
 	timer_slave_set_trigger(TIM1, TIM_SMCR_TS_ETRF);
 	timer_slave_set_mode(TIM1, TIM_SMCR_SMS_TM);
 	TIM1_OR |= TIM1_ETR_ADC1_RMP_AWD1;
 
 	/* When the timer is started, wait until a desired number of samples
-	 * is available in the buffer and then stop the ADC in the interrupt handler. */
+	 * is available in the buffer and then stop the ADC in the capture/compare
+	 * interrupt handler. */
 	timer_disable_oc_preload(TIM1, TIM_OC1);
-	/** @todo the time instant should be configurable */
-	timer_set_oc_value(TIM1, TIM_OC1, 2047 * 30);
-	timer_enable_irq(TIM1, TIM_DIER_CC1IE);
-
-	/* Enable ADC1 for channels 1 and 2. */
-	rcc_periph_clock_enable(RCC_ADC12);
-	ADC12_CCR |= ADC_CCR_CKMODE_DIV1;
-
-	{
-		/* Setup channel 1. */
-		adc_set_sample_time_on_all_channels(ADC1, ADC_SMPR_SMP_4DOT5CYC);
-		uint8_t channels[16] = {4};
-		adc_set_regular_sequence(ADC1, 1, channels);
-
-		/* Select ADC conversion trigger by TIM3 and enable the DMA. */
-		ADC1_CFGR |= ADC_CFGR_EXTEN_RISING_EDGE;
-		ADC1_CFGR |= ADC_CFGR_EXTSEL_EXT4;
-		ADC1_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
-
-		/* Configure ADC1 analog watchdog for channel 1. */
-		ADC1_TR1 = (uint32_t)((3000 << 16) | 1000);
-		ADC1_CFGR |= ADC_CFGR_AWD1EN;
-
-		/* And start the ADC1. */
-		adc_power_on(ADC1);
-		ADC1_CR |= ADC_CR_ADSTART;
-	}
-
-	{
-		/* Setup channel 2. */
-		adc_set_sample_time_on_all_channels(ADC2, ADC_SMPR_SMP_4DOT5CYC);
-		uint8_t channels[16] = {4};
-		adc_set_regular_sequence(ADC2, 1, channels);
-
-		/* Select ADC conversion trigger by TIM3 and enable the DMA. */
-		ADC2_CFGR |= ADC_CFGR_EXTEN_RISING_EDGE;
-		ADC2_CFGR |= ADC_CFGR_EXTSEL_EXT4;
-		ADC2_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
-
-		/* Configure ADC2 analog watchdog for channel 1. */
-		ADC2_TR1 = (uint32_t)((2100 << 16) | 1900);
-		ADC2_CFGR |= ADC_CFGR_AWD1EN;
-
-		/* And start the ADC2. */
-		adc_power_on(ADC2);
-		ADC2_CR |= ADC_CR_ADSTART;
-	}
-
-	/* Channels 3 and 4. */
-	rcc_periph_clock_enable(RCC_ADC34);
-	ADC34_CCR |= ADC_CCR_CKMODE_DIV1;
-
-	{
-		/* Setup channel 3. */
-		adc_set_sample_time_on_all_channels(ADC3, ADC_SMPR_SMP_4DOT5CYC);
-		uint8_t channels[16] = {2};
-		adc_set_regular_sequence(ADC3, 1, channels);
-
-		/* Select ADC conversion trigger by TIM3 and enable the DMA. */
-		ADC3_CFGR |= ADC_CFGR_EXTEN_RISING_EDGE;
-		ADC3_CFGR |= ADC_CFGR_EXTSEL_EXT11;
-		ADC3_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
-
-		/* Configure ADC3 analog watchdog for channel 1. */
-		ADC3_TR1 = (uint32_t)((2100 << 16) | 1900);
-		ADC3_CFGR |= ADC_CFGR_AWD1EN;
-
-		/* And start the ADC3. */
-		adc_power_on(ADC3);
-		ADC3_CR |= ADC_CR_ADSTART;
-	}
-
-	{
-		/* Setup channel 4. */
-		adc_set_sample_time_on_all_channels(ADC4, ADC_SMPR_SMP_4DOT5CYC);
-		uint8_t channels[16] = {2};
-		adc_set_regular_sequence(ADC4, 1, channels);
-
-		/* Select ADC conversion trigger by TIM3 and enable the DMA. */
-		ADC4_CFGR |= ADC_CFGR_EXTEN_RISING_EDGE;
-		ADC4_CFGR |= ADC_CFGR_EXTSEL_EXT11;
-		ADC4_CFGR |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
-
-		/* Configure ADC3 analog watchdog for channel 1. */
-		ADC4_TR1 = (uint32_t)((2100 << 16) | 1900);
-		ADC4_CFGR |= ADC_CFGR_AWD1EN;
-
-		/* And start the ADC3. */
-		adc_power_on(ADC4);
-		ADC4_CR |= ADC_CR_ADSTART;
-	}
+	timer_set_oc_value(TIM1, TIM_OC1, self->trigger_delay - 1);
 
 	return SAMPLER_RET_OK;
 }
 
 
-sampler_ret_t sampler_start(Sampler *self) {
-	if (self == NULL) {
-		return SAMPLER_RET_FAILED;
-	}
+static sampler_ret_t sampler_start_triggers(Sampler *self) {
+	(void)self;
 
-	/* Reset analog watchdog delay timers and enable their interrupts.
-	 * They will be triggered by the watchdogs. */
+	/** @todo the trigger is enabled whenever the ADC is running. It basically cannot
+	 *        be disabled as it is configured in slave mode and is enabled by the
+	 *        trigger input. One way how to disable it is to disable the trigger input
+	 *        or disable analog watchdogs.
+	 *        Also, the trigger and the timer can be left enabled and we may disable
+	 *        the CC interrupt only. */
+
+	/* Always start from the zero. */
 	timer_set_counter(TIM1, 0);
 	timer_enable_irq(TIM1, TIM_DIER_CC1IE);
 
-	/* Setup and enable DMA for all channels. */
-	for (uint8_t i = 0; i < 4; i++) {
-		sampler_dma_enable(&sampler, i);
-	}
-
-	/* Start the TIM3 to enable ADC sampling. We need to do this synchronously
-	 * to the TIM2 in order to know the exact position within a single second. */
-	uint32_t current = timer_get_counter(TIM2);
-
-	/* Prepare the starting position sufficiently in the future. */
-	uint32_t next = (current / ADC_BUFFER_SIZE / 30) * 30 * ADC_BUFFER_SIZE + 2 * 30 * ADC_BUFFER_SIZE;
-
-	for (uint8_t i = 0; i < 4; i++) {
-		self->buf[i].buffer_start_time = next;
-	}
-	/* Ask the GPSDO to make a trigger pulse to enable the TIM3. */
-	gpsdo_sync_start(&gpsdo, next);
-
 	return SAMPLER_RET_OK;
 }
 
 
-sampler_ret_t sampler_stop(Sampler *self) {
-	if (self == NULL) {
-		return SAMPLER_RET_FAILED;
-	}
+static sampler_ret_t sampler_stop_triggers(Sampler *self) {
+	(void)self;
 
-	/* Disable triggering of the ADC. */
-	timer_disable_counter(TIM3);
-
-	/* Disable watchdog delay timers and clear any pending interrupts. */
+	/* As the timer is run in slave mode and is enabled by an external trigger,
+	 * disabling the timer is not enough. The CC interrupt must be disabled too. */
+	timer_disable_counter(TIM1);
 	timer_disable_irq(TIM1, TIM_DIER_CC1IE);
 	timer_clear_flag(TIM1, TIM_SR_CC1IF);
-	timer_disable_counter(TIM1);
-
-	for (size_t i = 0; i < 4; i++) {
-		/* Position in the buffer AFTER the ADC is stopped. */
-		self->buf[i].buffer_second_time = self->buf[i].buffer_start_time % self->timer_freq_hz;
-		self->buf[i].buffer_pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
-		self->buf[i].trigger_pos = self->buf[i].buffer_pos - 2048;
-		self->buf[i].trigger_time = self->buf[i].buffer_second_time + self->buf[i].trigger_pos * 30;
-
-		/* Triggered in the brevious second. */
-		if (self->buf[i].trigger_time < 0) {
-			self->buf[i].trigger_time += self->timer_freq_hz;
-		}
-	}
 
 	return SAMPLER_RET_OK;
 }
 
 
-sampler_ret_t sampler_dma_enable(Sampler *self, uint8_t sampler_channel) {
+static sampler_ret_t sampler_init_adc(Sampler *self, uint32_t adc, uint32_t adc_channel) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	if (adc == ADC1 || adc == ADC2) {
+		rcc_periph_clock_enable(RCC_ADC12);
+		ADC12_CCR |= ADC_CCR_CKMODE_DIV1;
+	} else if (adc == ADC3 || adc == ADC4) {
+		rcc_periph_clock_enable(RCC_ADC34);
+		ADC34_CCR |= ADC_CCR_CKMODE_DIV1;
+	} else {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	/* Perform ADC calibration once. */
+	ADC_CR(adc) |= ADC_CR_ADCAL;
+	while (ADC_CR(adc) & ADC_CR_ADCAL) {
+		;
+	}
+
+	adc_set_sample_time_on_all_channels(adc, ADC_SMPR_SMP_4DOT5CYC);
+	uint8_t channels[16] = {adc_channel};
+	adc_set_regular_sequence(adc, 1, channels);
+
+	/* Select ADC conversion trigger by TIM3 and enable the DMA. */
+	ADC_CFGR(adc) |= ADC_CFGR_EXTEN_RISING_EDGE;
+
+	if (adc == ADC1 || adc == ADC2) {
+		ADC_CFGR(adc) |= ADC_CFGR_EXTSEL_EXT4;
+	} else {
+		ADC_CFGR(adc) |= ADC_CFGR_EXTSEL_EXT11;
+	}
+	ADC_CFGR(adc) |= ADC_CFGR_DMACFG | ADC_CFGR_DMAEN;
+
+	/* Configure the analog watchdog. */
+	ADC_TR1(adc) = (uint32_t)(((2048 + self->trigger_value) << 16) | (2048 - self->trigger_value));
+	ADC_CFGR(adc) |= ADC_CFGR_AWD1EN;
+
+	/* And start the ADC. */
+	adc_power_on(adc);
+	ADC_CR(adc) |= ADC_CR_ADSTART;
+
+	return SAMPLER_RET_OK;
+}
+
+
+/* DMA data for all 4 channels. */
+static const uint32_t dma_controllers[4] = {DMA1, DMA2, DMA2, DMA2};
+static const uint32_t dma_channels[4] = {DMA_CHANNEL1, DMA_CHANNEL1, DMA_CHANNEL5, DMA_CHANNEL2};
+static const uint32_t adc_registers[4] = {
+	(uint32_t)&ADC1_DR,
+	(uint32_t)&ADC2_DR,
+	(uint32_t)&ADC3_DR,
+	(uint32_t)&ADC4_DR,
+};
+
+
+static sampler_ret_t sampler_dma_enable(Sampler *self, uint8_t sampler_channel) {
 	if (self == NULL) {
 		return SAMPLER_RET_FAILED;
 	}
 
-	uint32_t dma = 0;
-	uint32_t dma_channel = 0;
-	uint32_t adc_dr = 0;
-	switch (sampler_channel) {
-		case 0:
-			dma = DMA1;
-			dma_channel = DMA_CHANNEL1;
-			adc_dr = (uint32_t)&ADC1_DR;
-			break;
-		case 1:
-			dma = DMA2;
-			dma_channel = DMA_CHANNEL1;
-			adc_dr = (uint32_t)&ADC2_DR;
-			break;
-		case 2:
-			dma = DMA2;
-			dma_channel = DMA_CHANNEL5;
-			adc_dr = (uint32_t)&ADC3_DR;
-			break;
-		case 3:
-			dma = DMA2;
-			dma_channel = DMA_CHANNEL2;
-			adc_dr = (uint32_t)&ADC4_DR;
-			break;
-		default:
-			return SAMPLER_RET_FAILED;
-	}
+	uint32_t dma = dma_controllers[sampler_channel];
+	uint32_t dma_channel = dma_channels[sampler_channel];
+	uint32_t adc_dr = adc_registers[sampler_channel];
 
 	dma_disable_channel(dma, dma_channel);
 	dma_set_priority(dma, dma_channel, DMA_CCR_PL_HIGH);
@@ -331,40 +264,174 @@ sampler_ret_t sampler_dma_enable(Sampler *self, uint8_t sampler_channel) {
 }
 
 
-sampler_ret_t sampler_print_buffer(Sampler *self) {
-
-	for (size_t i = 0; i < 1; i++) {
-		printf("channel %u:", i + 1);
-		// printf("  buffer_start_time: %lu (%lu us)", self->buf[i].buffer_start_time, self->buf[i].buffer_start_time / 60);
-		// printf("  buffer_pos: %lu", self->buf[i].buffer_pos);
-		// printf("  trigger_pos: %lu", self->buf[i].trigger_pos);
-		printf("  buffer_second_time: %10lu (%10lu us)", self->buf[i].buffer_second_time, self->buf[i].buffer_second_time / 60);
-		printf("  trigger_time: %10ld (%10ld us)", self->buf[i].trigger_time, self->buf[i].trigger_time / 60);
-
-		printf("\n");
-	}
-
-	// printf("buffer=");
-	// for (size_t i = self->buf[0].buffer_pos + 1; i < ADC_BUFFER_SIZE; i++) {
-		// printf("%04x", (uint16_t)self->buf[3].adc_buffer[i]);
-	// }
-	// for (size_t i = 0; i < self->buf[0].buffer_pos; i++) {
-		// printf("%04x", (uint16_t)self->buf[3].adc_buffer[i]);
-	// }
-	// printf("\n");
-
-}
-
-
-sampler_ret_t sampler_dma_completed_handler(Sampler *self, uint8_t channel) {
+sampler_ret_t sampler_init(
+	Sampler *self,
+	uint32_t timer_freq_hz,
+	uint32_t adc_freq_hz,
+	uint32_t trigger_delay,
+	uint16_t trigger_value
+) {
 	if (self == NULL) {
 		return SAMPLER_RET_FAILED;
 	}
 
-	self->buf[channel].buffer_start_time = (self->buf[channel].buffer_start_time + 30 * ADC_BUFFER_SIZE);
-	if (self->buf[channel].buffer_start_time > gpsdo.timer_period) {
-		self->buf[channel].buffer_start_time -= gpsdo.timer_period;
+	self->adc_freq_hz = adc_freq_hz;
+	self->timer_freq_hz = timer_freq_hz;
+	self->trigger_delay = trigger_delay;
+	self->trigger_value = trigger_value;
+
+	sampler_init_clocks(self);
+	sampler_init_adc_trigger_clock(self);
+	sampler_init_triggers(self);
+
+	sampler_init_adc(self, ADC1, 4);
+	sampler_init_adc(self, ADC2, 4);
+	sampler_init_adc(self, ADC3, 2);
+	sampler_init_adc(self, ADC4, 2);
+
+	return SAMPLER_RET_OK;
+}
+
+
+sampler_ret_t sampler_start(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_FAILED;
 	}
 
+	/* Reset analog watchdog delay timers and enable their interrupts.
+	 * They will be triggered by the watchdogs. */
+	sampler_start_triggers(self);
+
+	/* Setup and enable DMA for all channels. */
+	for (uint8_t i = 0; i < 4; i++) {
+		sampler_dma_enable(&sampler, i);
+	}
+
+	/* Start the TIM3 to enable ADC sampling. We need to do this synchronously
+	 * to the TIM2 in order to know the exact position within a single second. */
+	uint32_t current = timer_get_counter(TIM2);
+
+	/* Prepare the starting position sufficiently in the future. */
+	uint32_t tics_per_sample = self->timer_freq_hz / self->adc_freq_hz;
+	uint32_t buffer_size_tics = ADC_BUFFER_SIZE * tics_per_sample;
+	uint32_t next = (current / buffer_size_tics) * buffer_size_tics + 2 * buffer_size_tics;
+	self->buffer_second_time = next % self->timer_freq_hz;
+	self->buffer_time = next / self->timer_freq_hz;
+
+	/* Ask the GPSDO to make a trigger pulse to enable the TIM3. */
+	gpsdo_sync_start(&gpsdo, next);
+
+	return SAMPLER_RET_OK;
+}
+
+
+sampler_ret_t sampler_stop(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_FAILED;
+	}
+
+	/* Disable triggering of the ADC. */
+	timer_disable_counter(TIM3);
+
+	/* Disable watchdog delay timers and clear any pending interrupts. */
+	sampler_stop_triggers(self);
+
+	/* Position in the buffer AFTER the ADC is stopped (in samples). */
+	self->buffer_pos = ADC_BUFFER_SIZE - DMA_CNDTR(DMA1, DMA_CHANNEL1);
+
+	/* Trigger position is trigger_delay earlier. It may be negative! */
+	int32_t trigger_pos = self->buffer_pos - self->trigger_delay;
+
+	self->trigger_time = self->buffer_time;
+	self->trigger_second_time = self->buffer_second_time + trigger_pos * (self->timer_freq_hz / self->adc_freq_hz);
+
+	/* Buffer start is in this second but stop was triggered in the previous second. */
+	if (self->trigger_second_time < 0) {
+		self->trigger_second_time += self->timer_freq_hz;
+		self->trigger_time -= 1;
+	}
+	/* Buffer start is in this second but stop was triggered in the next second. */
+	if (self->trigger_second_time >= (int32_t)self->timer_freq_hz) {
+		self->trigger_second_time -= self->timer_freq_hz;
+		self->trigger_time += 1;
+	}
+
+	return SAMPLER_RET_OK;
+}
+
+
+/* Normally the sampler is triggered by the analog watchdog. This function allows
+ * it to be triggered manually when needed. */
+sampler_ret_t sampler_trigger(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	/** @todo not implemented */
+
+	return SAMPLER_RET_OK;
+}
+
+
+sampler_ret_t sampler_print_buffer(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	// printf("  buffer_start_time: %lu (%lu us)", self->buf[i].buffer_start_time, self->buf[i].buffer_start_time / 60);
+	// printf("  buffer_pos: %lu", self->buf[i].buffer_pos);
+	// printf("  trigger_pos: %lu", self->buf[i].trigger_pos);
+	printf("  time: %lu.%07lu", self->buffer_time, self->buffer_second_time / 6);
+	printf("  trigger:  %ld.%07ld", self->trigger_time, self->trigger_second_time / 6);
+
+	printf("\n");
+
+	printf("buffer=");
+	for (size_t i = self->buffer_pos + 1; i < ADC_BUFFER_SIZE; i++) {
+		printf("%04x", (uint16_t)self->buf[0].adc_buffer[i]);
+	}
+	for (size_t i = 0; i < self->buffer_pos; i++) {
+		printf("%04x", (uint16_t)self->buf[0].adc_buffer[i]);
+	}
+	printf("\n");
+
+	return SAMPLER_RET_OK;
+}
+
+
+sampler_ret_t sampler_save_buffer(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	self->buffer_read_pos = 0;
+	self->buffer_not_empty = true;
+
+	return SAMPLER_RET_OK;
+}
+
+
+sampler_ret_t sampler_dma_completed_handler(Sampler *self) {
+	if (self == NULL) {
+		return SAMPLER_RET_BAD_ARG;
+	}
+
+	/* After the DMA cycle is completed and the buffer is full (4096 samples of data),
+	 * increase the buffer starting mark by buffer_size * samples_per_second (duration
+	 * of sampling one single buffer). If the value overflows one second (timer_freq_hz),
+	 * crop it.
+	 * This does not introduce any delay in data processing.
+	 */
+	/** @todo there might be a race condition when the interrupt delay is longer than
+	 *        the processing speed if the signal is sampled right at the buffer boundary.
+	 *        The buffer_second_time might not be incremented in this case.
+	 */
+
+	uint32_t tics_per_sample = self->timer_freq_hz / self->adc_freq_hz;
+	self->buffer_second_time = self->buffer_second_time + tics_per_sample * ADC_BUFFER_SIZE;
+	if (self->buffer_second_time >= self->timer_freq_hz) {
+		self->buffer_second_time -= self->timer_freq_hz;
+		self->buffer_time += 1;
+	}
 	return SAMPLER_RET_OK;
 }

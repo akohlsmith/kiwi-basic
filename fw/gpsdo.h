@@ -31,9 +31,9 @@
 
 #pragma once
 
-#include "stdint.h"
-#include "stdbool.h"
-#include "stdlib.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 #include <libopencm3/stm32/dac.h>
 

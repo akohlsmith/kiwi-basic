@@ -17,75 +17,12 @@
 
 #include "board.h"
 #include "gpsdo.h"
-#include "uxb_locm3.h"
 #include "sampler.h"
+#include "uxb_slave.h"
+
 
 Gpsdo gpsdo;
 Sampler sampler;
-
-/** @todo sampler, move */
-uint32_t ccr_old = 0;
-
-/** @todo UXB related, move */
-UxbMasterLocm3 uxb;
-UxbInterface iface1;
-UxbSlot slot1;
-UxbSlot descriptor_slot;
-uint8_t slot1_buffer[1024];
-
-const char *uxb_descriptor[] = {
-	"device=kiwi-basic",
-	"hw-version=1.0.0+20170723",
-	"fw-version=1.0.0",
-	"cspeed=4",
-	"dspeed=4",
-	"slot=1,bootloader,1.0.0",
-	"slot=2,rtc,1.0.0",
-	"slot=3,hrtime,1.0.0",
-	"slot=4,waveform,1.0.0",
-	NULL,
-};
-
-uint8_t descriptor_slot_buffer[64];
-
-
-
-static void delay_simple(uint32_t d) {
-	for (uint32_t i = 0; i < d; i++) {
-		__asm__("nop");
-	}
-}
-
-
-/** @todo UXB related, move */
-static uxb_master_locm3_ret_t uxb_read_descriptor(void *context, uint8_t *buf, size_t len) {
-	uint8_t zero = 0;
-
-	if (len != 1) {
-		return UXB_MASTER_LOCM3_RET_FAILED;
-	}
-	if (buf[0] == 0) {
-		/* Send the 0 back. */
-		uxb_slot_send_data(&descriptor_slot, &zero, 1, true);
-	} else {
-		uint8_t descriptor_index = buf[0] - 1;
-		if (uxb_descriptor[descriptor_index] == NULL) {
-			uxb_slot_send_data(&descriptor_slot, &zero, 1, true);
-		} else {
-			uxb_slot_send_data(&descriptor_slot, uxb_descriptor[descriptor_index], strlen(uxb_descriptor[descriptor_index]) + 1, true);
-		}
-	}
-
-	return UXB_MASTER_LOCM3_RET_OK;
-}
-
-
-/** @todo UXB related, move */
-static uxb_master_locm3_ret_t uxb_data_received(void *context, uint8_t *buf, size_t len) {
-	// usart_send_blocking(USART1, 'A');
-	uxb_slot_send_data(&slot1, (uint8_t *)&sampler.buf[0].adc_buffer, 1024, true);
-	return UXB_MASTER_LOCM3_RET_OK;
-}
 
 
 void gpio_setup(void) {
@@ -125,6 +62,69 @@ void gpio_setup(void) {
 	nvic_enable_irq(NVIC_TIM3_IRQ);
 	nvic_enable_irq(NVIC_ADC1_2_IRQ);
 
+	/* Unused pins. */
+	gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
+		GPIO0 |
+		GPIO2 |
+		GPIO6 |
+		GPIO11 |
+		GPIO12
+	);
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
+		GPIO0 |
+		GPIO1 |
+		GPIO2 |
+		GPIO6 |
+		GPIO7 |
+		GPIO8 |
+		GPIO10 |
+		GPIO11 |
+		GPIO12 |
+		GPIO13 |
+		GPIO14 |
+		GPIO15
+	);
+	gpio_mode_setup(GPIOC, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
+		GPIO0 |
+		GPIO1 |
+		GPIO2 |
+		GPIO3 |
+		GPIO4 |
+		GPIO5 |
+		GPIO6 |
+		GPIO7 |
+		GPIO8 |
+		GPIO13
+	);
+	gpio_mode_setup(GPIOD, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
+		GPIO0 |
+		GPIO1 |
+		GPIO2 |
+		GPIO3 |
+		GPIO4 |
+		GPIO5 |
+		GPIO6 |
+		GPIO7 |
+		GPIO11 |
+		GPIO12 |
+		GPIO13 |
+		GPIO14 |
+		GPIO15
+	);
+	gpio_mode_setup(GPIOE, GPIO_MODE_INPUT, GPIO_PUPD_PULLDOWN,
+		GPIO0 |
+		GPIO1 |
+		GPIO3 |
+		GPIO4 |
+		GPIO7 |
+		GPIO8 |
+		GPIO10 |
+		GPIO11 |
+		GPIO12 |
+		GPIO13 |
+		GPIO14
+	);
+
 	// gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO5);
 	gpio_mode_setup(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO3);
 
@@ -151,74 +151,10 @@ void gpio_setup(void) {
 	/* VCTCXO steering, DAC output. */
 	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO4);
 
-	/* Initialize the UXB bus. */
-	rcc_periph_clock_enable(RCC_SPI1);
-	rcc_periph_clock_enable(RCC_TIM7);
-
-	/* Setup a timer for precise UXB protocol delays. */
-	timer_reset(TIM7);
-	timer_set_mode(TIM7, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-	timer_continuous_mode(TIM7);
-	timer_direction_up(TIM7);
-	timer_disable_preload(TIM7);
-	timer_enable_update_event(TIM7);
-	timer_set_prescaler(TIM7, (rcc_ahb_frequency / 1000000) - 1);
-	timer_set_period(TIM7, 65535);
-	timer_enable_counter(TIM7);
-
-	uxb_master_locm3_init(&uxb, &(struct uxb_master_locm3_config) {
-		.spi_port = SPI1,
-		.spi_af = GPIO_AF5,
-		.sck_port = GPIOB, .sck_pin = GPIO3,
-		.miso_port = GPIOB, .miso_pin = GPIO4,
-		.mosi_port = GPIOB, .mosi_pin = GPIO5,
-		.frame_port = GPIOA, .frame_pin = GPIO15,
-		.id_port = GPIOC, .id_pin = GPIO10,
-		.delay_timer = TIM7,
-		.delay_timer_freq_mhz = 1,
-		.control_prescaler = SPI_CR1_BR_FPCLK_DIV_16,
-		.data_prescaler = SPI_CR1_BR_FPCLK_DIV_16,
-	});
-
-	uxb_interface_init(&iface1);
-	uxb_interface_set_address(
-		&iface1,
-		(uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04},
-		(uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	);
-	uxb_master_locm3_add_interface(&uxb, &iface1);
-
-	uxb_slot_init(&slot1);
-	uxb_slot_set_slot_number(&slot1, 5);
-	uxb_slot_set_slot_buffer(&slot1, slot1_buffer, 1024);
-	uxb_slot_set_data_received(&slot1, uxb_data_received, NULL);
-	uxb_interface_add_slot(&iface1, &slot1);
-
-	uxb_slot_init(&descriptor_slot);
-	uxb_slot_set_slot_number(&descriptor_slot, 0);
-	uxb_slot_set_slot_buffer(&descriptor_slot, descriptor_slot_buffer, sizeof(descriptor_slot_buffer));
-	uxb_slot_set_data_received(&descriptor_slot, uxb_read_descriptor, NULL);
-	uxb_interface_add_slot(&iface1, &descriptor_slot);
-
-	/* Setup uxb exti interrupts. */
-	nvic_enable_irq(NVIC_EXTI15_10_IRQ);
-	rcc_periph_clock_enable(RCC_SYSCFG);
-	exti_select_source(EXTI15, GPIOA);
-	exti_set_trigger(EXTI15, EXTI_TRIGGER_FALLING);
-	exti_enable_request(EXTI15);
-
-}
-
-
-void exti15_10_isr(void) {
-	exti_reset_request(EXTI15);
-
-	exti_disable_request(EXTI15);
-	uxb_master_locm3_frame_irq(&uxb);
-	exti_enable_request(EXTI15);
 
 
 }
+
 
 
 /* Debug output over USART1. */
@@ -254,8 +190,9 @@ int _write(int file, char *ptr, int len) {
 void tim1_cc_isr(void) {
 	if (TIM_SR(TIM1) & TIM_SR_CC1IF) {
 		sampler_stop(&sampler);
-		sampler_print_buffer(&sampler);
-		sampler_start(&sampler);
+		sampler_save_buffer(&sampler);
+		/* Do not start again, otherwise we overwrite old data.
+		 * There is no buffer management yet. */
 	}
 }
 
@@ -311,46 +248,9 @@ void tim3_isr(void) {
 }
 */
 
-void adc1_2_isr(void) {
-
-	/* No ADC watchdog interrupt, not needed. */
-	if (ADC1_ISR & ADC_ISR_AWD1) {
-		ADC1_ISR |= ADC_ISR_AWD1;
-		printf("awd %d\n", ADC1_DR);
-	}
-
-	// if (ADC1_ISR & ADC_ISR_EOS) {
-		// ADC1_ISR |= ADC_ISR_EOS;
-		// printf("%u\n", (unsigned int)adc_read_regular(ADC1));
-	// }
-
-}
-
-
 void dma1_channel1_isr(void) {
 	if (dma_get_interrupt_flag(DMA1, DMA_CHANNEL1, DMA_TCIF)) {
 		dma_clear_interrupt_flags(DMA1, DMA_CHANNEL1, DMA_TCIF);
-		sampler_dma_completed_handler(&sampler, 0);
-	}
-}
-
-void dma2_channel1_isr(void) {
-	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL1, DMA_TCIF)) {
-		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL1, DMA_TCIF);
-		sampler_dma_completed_handler(&sampler, 1);
-	}
-}
-
-void dma2_channel5_isr(void) {
-	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL5, DMA_TCIF)) {
-		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL5, DMA_TCIF);
-		sampler_dma_completed_handler(&sampler, 2);
-	}
-}
-
-void dma2_channel2_isr(void) {
-	if (dma_get_interrupt_flag(DMA2, DMA_CHANNEL2, DMA_TCIF)) {
-		dma_clear_interrupt_flags(DMA2, DMA_CHANNEL2, DMA_TCIF);
-		sampler_dma_completed_handler(&sampler, 3);
+		sampler_dma_completed_handler(&sampler);
 	}
 }

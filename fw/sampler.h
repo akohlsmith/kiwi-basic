@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, Marek Koza (qyx@krtko.org)
+ * Copyright (c) 2018, Marek Koza (qyx@krtko.org)
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,38 +30,69 @@
 #include "stdlib.h"
 
 
+/* Size of the sampler buffer in samples. */
 #define ADC_BUFFER_SIZE 4096
 
 
 typedef enum {
 	SAMPLER_RET_OK = 0,
 	SAMPLER_RET_FAILED,
+	SAMPLER_RET_BAD_ARG,
 } sampler_ret_t;
 
 
 struct sampler_buffer {
 	uint16_t adc_buffer[ADC_BUFFER_SIZE];
-	uint32_t buffer_start_time;
-	uint32_t buffer_second_time;
-	uint32_t buffer_pos;
-	int32_t trigger_pos;
-	int32_t trigger_time;
 };
 
 typedef struct {
+	/* Frequency of the timers (AHB frequency). */
 	uint32_t timer_freq_hz;
+
+	/* Sampling frequency of the ADC. */
 	uint32_t adc_freq_hz;
 
+	/* After the trigger occurs, we wait trigger_delay samples
+	 * before stopping the ADC and saving the result. */
+	uint32_t trigger_delay;
+
+	/* APPROXIMATE time in seconds when the trigger occured. */
+	int32_t trigger_time;
+
+	/* APPROXIMATE time in second fractions when the trigger
+	 * occured. There are timer_freq_hz fractions within a second. */
+	int32_t trigger_second_time;
+
+	/* Value of the signal (amplitude) which triggers a buffer
+	 * saving. Both positive and negative value applies. */
+	uint16_t trigger_value;
+
+	/* Position of the DMA transfer within the buffer (in samples). */
+	uint32_t buffer_pos;
+
+	/* ne buffer for every channel. */
 	struct sampler_buffer buf[4];
 
+	/* EXACT time in seconds when the buffer starts. */
+	uint32_t buffer_second_time;
+
+	/* EXACT time in second fractions when the buffer starts. */
+	uint32_t buffer_time;
+
+	/* Temporary handling of buffer readings. */
+	size_t buffer_read_pos;
+	bool buffer_not_empty;
 } Sampler;
 
 
-
-sampler_ret_t sampler_init(Sampler *self, uint32_t timer_freq_hz, uint32_t adc_freq_hz);
-sampler_ret_t sampler_dma_enable(Sampler *self, uint8_t sampler_channel);
+sampler_ret_t sampler_init(
+	Sampler *self,
+	uint32_t timer_freq_hz,
+	uint32_t adc_freq_hz,
+	uint32_t trigger_delay,
+	uint16_t trigger_value
+);
 sampler_ret_t sampler_print_buffer(Sampler *self);
-
 sampler_ret_t sampler_start(Sampler *self);
 sampler_ret_t sampler_stop(Sampler *self);
-sampler_ret_t sampler_dma_completed_handler(Sampler *self, uint8_t channel);
+sampler_ret_t sampler_dma_completed_handler(Sampler *self);

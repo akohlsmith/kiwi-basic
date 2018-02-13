@@ -6,7 +6,11 @@
 
 #include "gpsdo.h"
 #include "sampler.h"
+#include "uxb_waveform.h"
 
+
+#define FIRMWARE_VERSION "1.0.0-a.1"
+#define HARDWARE_VERSION "1.0.0+20170723"
 
 extern uint32_t samples;
 extern Gpsdo gpsdo;
